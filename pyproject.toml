@@ -1,0 +1,31 @@
+[project]
+name = "attention_matrix_xai_workbench"
+version = "0.1.0"
+description = "A Python project for visualising attention matrices with marimo notebooks."
+license = { file = "license.md" }
+requires-python = ">=3.11"
+dependencies = [
+    "captum>=0.9.0",
+    "hypothesis>=6.168.3",
+    "marimo[recommended]>=0.25.0",
+    "matplotlib>=3.11.2",
+    "numpy>=2.4.6",
+    "optuna>=5.0.0",
+    "polars>=1.44.2",
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+    "scipy>=1.17.1",
+    "torch>=2.14.0",
+    "torchmetrics>=1.9.0",
+    "tqdm>=4.70.1",
+    "ty>=0.0.84",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+lint.select = ["E", "F", "C90", "I", "Q"]
