@@ -49,6 +49,7 @@ class MultiheadPooledAttention(nn.Module):
         self.attn = nn.MultiheadAttention(
             embed_dim, num_heads=num_heads, batch_first=True, device=device, dtype=dtype
         )
+        self.attn_matrix_hookpoint = nn.Identity()
         self.proj = nn.Linear(num_queries * embed_dim, embed_dim, device=device, dtype=dtype)
 
     def _get_activation_fn(self) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -67,80 +68,43 @@ class MultiheadPooledAttention(nn.Module):
         q = self.query_token.expand(batch_size, -1, -1).contiguous()
         x = x.contiguous()
 
-        is_softmax = isinstance(self.activation, str) and self.activation.lower() in {
-            "softmax",
-            "time-series",
-        }
+        B, T, D = q.shape
+        _, S, _ = x.shape
+        H = self.attn.num_heads
+        D_h = D // H
 
-        if is_softmax:
-            backends = [
-                torch.nn.attention.SDPBackend.FLASH_ATTENTION,
-                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
-                torch.nn.attention.SDPBackend.MATH,
-            ]
+        # Extract projection weights from the fused in_proj_weight
+        in_w = self.attn.in_proj_weight
+        in_b = self.attn.in_proj_bias
 
-            # Chunk along batch dimension to prevent exceeding CUDA grid block limit (65,535)
-            max_chunk = min(4096, max(1, 65535 // self.attn.num_heads))
-            if batch_size > max_chunk:
-                out_chunks = []
-                for i in range(0, batch_size, max_chunk):
-                    q_c = q[i : i + max_chunk].contiguous()
-                    x_c = x[i : i + max_chunk].contiguous()
-                    try:
-                        with torch.nn.attention.sdpa_kernel(backends):
-                            out_c, _ = self.attn(q_c, x_c, x_c, need_weights=False)
-                    except RuntimeError, torch.AcceleratorError:
-                        with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.MATH]):
-                            out_c, _ = self.attn(q_c, x_c, x_c, need_weights=False)
-                    out_chunks.append(out_c)
-                out = torch.cat(out_chunks, dim=0)
-            else:
-                try:
-                    with torch.nn.attention.sdpa_kernel(backends):
-                        out, _ = self.attn(q, x, x, need_weights=False)
-                except RuntimeError, torch.AcceleratorError:
-                    with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.MATH]):
-                        out, _ = self.attn(q, x, x, need_weights=False)
-        else:
-            # Manual multi-head attention to support custom activations
-            B, T, D = q.shape
-            _, S, _ = x.shape
-            H = self.attn.num_heads
-            D_h = D // H
+        # Project Q, K, V
+        q_proj = torch.nn.functional.linear(q, in_w[:D], in_b[:D] if in_b is not None else None)
+        k_proj = torch.nn.functional.linear(
+            x, in_w[D : 2 * D], in_b[D : 2 * D] if in_b is not None else None
+        )
+        v_proj = torch.nn.functional.linear(
+            x, in_w[2 * D :], in_b[2 * D :] if in_b is not None else None
+        )
 
-            # Extract weights
-            in_w = self.attn.in_proj_weight
-            in_b = self.attn.in_proj_bias
+        # Reshape for multi-head computation
+        q_proj = q_proj.view(B, T, H, D_h).transpose(1, 2)  # [B, H, T, D_h]
+        k_proj = k_proj.view(B, S, H, D_h).transpose(1, 2)  # [B, H, S, D_h]
+        v_proj = v_proj.view(B, S, H, D_h).transpose(1, 2)  # [B, H, S, D_h]
 
-            # Project Q, K, V
-            q_proj = torch.nn.functional.linear(q, in_w[:D], in_b[:D] if in_b is not None else None)
-            k_proj = torch.nn.functional.linear(
-                x, in_w[D : 2 * D], in_b[D : 2 * D] if in_b is not None else None
-            )
-            v_proj = torch.nn.functional.linear(
-                x, in_w[2 * D :], in_b[2 * D :] if in_b is not None else None
-            )
+        # Compute scaled dot-product attention logits: [B, H, T, S]
+        attn_weights = torch.matmul(q_proj, k_proj.transpose(-2, -1)) / (D_h**0.5)
 
-            # Reshape for heads
-            q_proj = q_proj.view(B, T, H, D_h).transpose(1, 2)  # [B, H, T, D_h]
-            k_proj = k_proj.view(B, S, H, D_h).transpose(1, 2)  # [B, H, S, D_h]
-            v_proj = v_proj.view(B, S, H, D_h).transpose(1, 2)  # [B, H, S, D_h]
+        # Apply activation (softmax by default; supports custom activations via ACTIVATION_REGISTRY)
+        activation_fn = self._get_activation_fn()
+        attn_weights = activation_fn(attn_weights)
 
-            # Compute scaled dot-product attention logits
-            attn_weights = torch.matmul(
-                # [B, H, T, S]
-                q_proj,
-                k_proj.transpose(-2, -1),
-            ) / (D_h**0.5)
+        # Route the attention weight matrix through the hookpoint.
+        self.attn_matrix_hookpoint(attn_weights)
 
-            # Apply custom activation
-            activation_fn = self._get_activation_fn()
-            attn_weights = activation_fn(attn_weights)
-
-            # Context fusion
-            out = torch.matmul(attn_weights, v_proj)  # [B, H, T, D_h]
-            out = out.transpose(1, 2).reshape(B, T, D)
-            out = self.attn.out_proj(out)
+        # Context fusion
+        out = torch.matmul(attn_weights, v_proj)  # [B, H, T, D_h]
+        out = out.transpose(1, 2).reshape(B, T, D)
+        out = self.attn.out_proj(out)
 
         out = out.reshape(batch_size, self.num_tokens * x.size(-1))
         return self.proj(out)
